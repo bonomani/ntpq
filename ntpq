@@ -1,0 +1,165 @@
+#!/usr/bin/perl
+
+# A Hobbit client-side module to check the local ntpd daemon
+# synchronization status.  Not to be confused with the built-in "ntp"
+# test, which checks the ntpd server remotely.
+
+# Copyright (C) 2008 Peter Eisentraut <petere@debian.org>
+# Copyright (C) 2022 Bonomani 
+# Permission is hereby granted, free of charge, to any person
+# obtaining a copy of this software and associated documentation
+# files (the "Software"), to deal in the Software without
+# restriction, including without limitation the rights to use,
+# copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following
+# conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+# OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+# OTHER DEALINGS IN THE SOFTWARE.
+
+use warnings;
+use strict;
+use Hobbit;
+use YAML::Tiny;
+my $ntpischrony;
+if ( ! -x '/usr/bin/ntpq' and system('ntpq -? >/dev/null 2>&1') != 0)  {
+    if (! -x '/usr/sbin/chronyd' and system('chronyc --help >/dev/null 2>&1') !=0) {
+        exit (0);
+    } else {
+        $ntpischrony = 1;
+    }
+}
+my $testname = 'ntpq';
+my $bb = new Hobbit("$testname");
+my $trends = Hobbit::trends;
+my $syspeer_stats = {};
+my $plugins_config = '/etc/xymon/plugins.yaml';
+my $ntpd_pid_file;
+if ($ntpischrony) {
+    $ntpd_pid_file = '/var/run/chrony/chronyd.pid';
+} else {
+    $ntpd_pid_file = '/var/run/ntpd.pid';
+}
+my $offset_warning = 100;
+my $offset_critical = 2000;
+
+
+
+if (-e $plugins_config) {
+    my $config_yaml = YAML::Tiny->read($plugins_config);
+    my $config = $config_yaml->[0]{"$testname"};
+
+    $ntpd_pid_file = $config->{'ntpd_pid_file'} if ( defined($config->{'ntpd_pid_file'}) );
+    $offset_warning = $config->{'offset_warning'} if ( defined($config->{'offset_warning'}) );
+    $offset_critical = $config->{'offset_critical'} if ( defined($config->{'offset_critical'}) );
+}
+
+
+my $found_syspeer = 0;
+my $recently_started = 0;
+my $initializing = 0;
+
+my @output;
+if ($ntpischrony) {
+    if (!`pgrep chronyd |wc -l`) {
+        $bb->color_line('yellow', "Chronyd process not found. Is chronyd running?\n\n");
+    }
+    @output = `chronyc -m -n -c tracking sources sourcestats 2>&1` or die;
+    my @tracking = split (',', shift(@output));
+    my $peer = $tracking[1];
+    $syspeer_stats->{'offset'} = substr($tracking[5]*1000,0,4);
+    $syspeer_stats->{'delay'} = substr($tracking[10]*1000,0,4);
+    $syspeer_stats->{'status'} = pop @tracking;
+    chomp $syspeer_stats->{'status'};
+    if ($syspeer_stats->{'status'} eq "Normal") {
+       $bb->color_line('green', "Leap status: OK\n\n");
+    } else {
+       $bb->color_line('yellow', "Leap status: -$syspeer_stats->{'status'}-\n\n");
+    }
+    $bb->print("NTP peers:\n\n");
+    $bb->print("MS Name/IP address         Stratum Poll Reach LastRx\n");
+    $bb->print("======================================================\n");
+    foreach my $line (@output) {
+        my @flds = split (',', $line);
+        if ($flds[0] eq '^' ) {
+            my $new_line = $flds[0].$flds[1].$flds[2].sprintf("%19s %3s %5s %5s", $flds[3], $flds[4], $flds[5], $flds[6])."\n" ;
+            if ($flds[2] eq $peer) {
+                $bb->color_line('green', $new_line);
+                $found_syspeer = 1;
+            } else {
+                $bb->color_line('clear', $new_line) ;
+            }
+        } else {
+            if ($flds[0] eq $peer) {
+                $syspeer_stats->{'jitter'} = substr((pop @flds) *1000, 0, 4);
+            }
+        }
+    }
+} else {
+    if (-f $ntpd_pid_file) {
+         $recently_started = (time - (stat($ntpd_pid_file))[9]) < 300;
+    } else {
+         $bb->color_line('yellow', "ntpd pid file $ntpd_pid_file not found. Is ntpd running?\n\n");
+    }
+    @output = `ntpq -np 2>&1` or die;
+    $bb->print("NTP peers:\n\n");
+    foreach my $line (@output) {
+        if ($line =~ /^  / or $line =~ /^==/ ) {
+            $bb->print('   ' . $line);
+        } elsif ($line =~ /^\*\S+\s+\S+\s+\d+ \w\s+[\dm-]+\s+[\d-]+\s+[\d-]+\s+([\d\.-]+)\s+([-\d\.+]+)\s+([\d\.-]+)/) {
+            ($syspeer_stats->{'delay'}, $syspeer_stats->{'offset'}, $syspeer_stats->{'jitter'}) = ($1, $2, $3);
+            $bb->color_line('green', $line);
+            $found_syspeer = 1;
+        } elsif ($line =~ /^( |x|\.|\-|\+|\#|o)/) {
+            $bb->color_line('clear', $line);
+            $initializing = 1 if $line =~ /\.INIT\.|\.STEP\./;
+        } else {
+            $bb->color_line('yellow', $line);
+        }
+    }
+}
+if ($found_syspeer) {
+
+    $bb->print( "\n" );
+    $bb->print( "SyspeerDelay: $syspeer_stats->{'delay'}\n" );
+    $bb->print( "SyspeerOffset: $syspeer_stats->{'offset'}\n" );
+    $bb->print( "SyspeerJitter: $syspeer_stats->{'jitter'}\n\n" );
+    $bb->print( "SyspeerOffset thresholds:\n" );
+    $bb->print( "Warning: ${offset_warning}ms\n" );
+    $bb->print( "Critical: ${offset_critical}ms\n" );
+
+    if (abs($syspeer_stats->{'offset'}) > $offset_critical) {
+        $bb->color_line('red', "SyspeerOffset > ${offset_critical}ms\n" );
+    } elsif (abs($syspeer_stats->{'offset'}) > $offset_warning) {
+        $bb->color_line('yellow', "SyspeerOffset > ${offset_warning}ms\n" );
+    }
+
+    $trends->print ("[${testname},SyspeerDelay.rrd]\n");
+    $trends->print ("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'delay'}\n");
+    $trends->print ("[${testname},SyspeerOffset.rrd]\n");
+    $trends->print ("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'offset'}\n");
+    $trends->print ("[${testname},SyspeerJitter.rrd]\n");
+    $trends->print ("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'jitter'}\n");
+
+} else {
+    $bb->print("\n");
+    if ($recently_started and $initializing) {
+        $bb->color_line('yellow', "No system peer entry (\"*\") found; ntpd was recently started and is initializing.\n");
+    } else {
+        $bb->color_line('red', "No system peer entry (\"*\") found\n");
+    }
+}
+
+#$trends->send;
+$bb->send;
+root@dc1tsde011:/usr/lib/xymon/client/ext#
