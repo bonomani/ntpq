@@ -31,24 +31,52 @@ use warnings;
 use strict;
 use Hobbit;
 use YAML::Tiny;
+
+sub conv2ms { # Convertie une chaine de timedatectl en ms
+   my ($ToConvert) = @_;
+   my $msResult=-1;
+
+   if ( defined $ToConvert ) {
+      if ( $ToConvert =~ m/^[^-+.0-9]*([-+.0-9]+)us$/ ) { $msResult = $1 ; $msResult = $msResult / 1000.000; } # ToConvert expressed in milliseconds, I convert if microseconds found (1000 us = 1 ms)
+      if ( $ToConvert =~ m/^[^-+.0-9]*([-+.0-9]+)ms$/ ) { $msResult = $1 ; } # just string cleanup 
+      if ( $ToConvert =~ m/^[^-+.0-9]*([-+.0-9]+)s$/ ) { $msResult = $1 ; $msResult = $msResult * 1000.000 ; } # idem if ToConvert was in seconds, I convert (1 s = 1000 ms)
+      if ( length( do { no warnings "numeric"; $ToConvert & "" } )) { $msResult = $ToConvert ; $msResult = $1 ; } # If ToConvert is an perl numeric, then assume it is in ms and do nothing.
+   }
+   return $msResult; # -1 mean error
+}
+
+
 my $ntpischrony;
+my $ntpissystemd;
+
 if ( ! -x '/usr/bin/ntpq' and system('ntpq -? >/dev/null 2>&1') != 0)  {
     if (! -x '/usr/sbin/chronyd' and system('chronyc --help >/dev/null 2>&1') !=0) {
-        exit (0);
+        if (! -x '/usr/bin/timedatectl' and system('/usr/bin/timedatectl --version >/dev/null 2>&1') !=0) {
+            exit (0);
+        }
+        else {
+		$ntpissystemd = 1;
+	}
     } else {
         $ntpischrony = 1;
     }
 }
+
 my $testname = 'ntpq';
 my $bb = new Hobbit("$testname");
 my $trends = Hobbit::trends;
 my $syspeer_stats = {};
 my $plugins_config = '/etc/xymon/plugins.yaml';
 my $ntpd_pid_file;
-if ($ntpischrony) {
-    $ntpd_pid_file = '/var/run/chrony/chronyd.pid';
+if ($ntpissystemd != 1) {
+	if ($ntpischrony) {
+	    $ntpd_pid_file = '/var/run/chrony/chronyd.pid';
+	} else {
+	    $ntpd_pid_file = '/var/run/ntpd.pid';
+	}
 } else {
-    $ntpd_pid_file = '/var/run/ntpd.pid';
+       $ntpd_pid_file = `systemctl status systemd-timesyncd.service | grep "Main PID"`;
+       $ntpd_pid_file =~ s@^\s+Main PID:\s+([0-9]+)\s+.*$@/proc/$1/stat@;
 }
 my $offset_warning = 100;
 my $offset_critical = 2000;
@@ -70,41 +98,78 @@ my $recently_started = 0;
 my $initializing = 0;
 
 my @output;
-if ($ntpischrony) {
-    if (!`pgrep chronyd |wc -l`) {
-        $bb->color_line('yellow', "Chronyd process not found. Is chronyd running?\n\n");
-    }
-    @output = `chronyc -m -n -c tracking sources sourcestats 2>&1` or die;
-    my @tracking = split (',', shift(@output));
-    my $peer = $tracking[1];
-    $syspeer_stats->{'offset'} = substr($tracking[5]*1000,0,4);
-    $syspeer_stats->{'delay'} = substr($tracking[10]*1000,0,4);
-    $syspeer_stats->{'status'} = pop @tracking;
-    chomp $syspeer_stats->{'status'};
-    if ($syspeer_stats->{'status'} eq "Normal") {
-       $bb->color_line('green', "Leap status: OK\n\n");
-    } else {
-       $bb->color_line('yellow', "Leap status: -$syspeer_stats->{'status'}-\n\n");
-    }
-    $bb->print("NTP peers:\n\n");
-    $bb->print("MS Name/IP address         Stratum Poll Reach LastRx\n");
-    $bb->print("======================================================\n");
-    foreach my $line (@output) {
+my @tracking;
+my %tracking;
+my %NTPMessage;
+
+if ( $ntpissystemd or $ntpischrony ) {
+   if ($ntpischrony and (not $ntpissystemd) ) {
+      if (!`pgrep chronyd |wc -l`) {
+         $bb->color_line('yellow', "Chronyd process not found. Is chronyd running?\n\n");
+      }
+      @output = `chronyc -m -n -c tracking sources sourcestats 2>&1` or die;
+      @tracking = split (',', shift(@output));
+      my $peer = $tracking[1];
+      $syspeer_stats->{'offset'} = substr($tracking[5]*1000,0,4);
+      $syspeer_stats->{'delay'} = substr($tracking[10]*1000,0,4);
+      $syspeer_stats->{'status'} = pop @tracking;
+      chomp $syspeer_stats->{'status'};
+      if ($syspeer_stats->{'status'} eq "Normal") {
+         $bb->color_line('green', "Leap status: OK\n\n");
+      } else {
+        $bb->color_line('yellow', "Leap status: -$syspeer_stats->{'status'}-\n\n");
+      }
+      $bb->print("NTP peers:\n\n");
+     $bb->print("MS Name/IP address         Stratum Poll Reach LastRx\n");
+     $bb->print("======================================================\n");
+     foreach my $line (@output) {
         my @flds = split (',', $line);
         if ($flds[0] eq '^' ) {
-            my $new_line = $flds[0].$flds[1].$flds[2].sprintf("%19s %3s %5s %5s", $flds[3], $flds[4], $flds[5], $flds[6])."\n" ;
-            if ($flds[2] eq $peer) {
-                $bb->color_line('green', $new_line);
-                $found_syspeer = 1;
-            } else {
-                $bb->color_line('clear', $new_line) ;
-            }
+           my $new_line = $flds[0].$flds[1].$flds[2].sprintf("%19s %3s %5s %5s", $flds[3], $flds[4], $flds[5], $flds[6])."\n" ;
+           if ($flds[2] eq $peer) {
+              $bb->color_line('green', $new_line);
+              $found_syspeer = 1;
+           } else {
+              $bb->color_line('clear', $new_line) ;
+           }
         } else {
-            if ($flds[0] eq $peer) {
-                $syspeer_stats->{'jitter'} = substr((pop @flds) *1000, 0, 4);
-            }
-        }
-    }
+	   if ($flds[0] eq $peer) {
+	      $syspeer_stats->{'jitter'} = substr((pop @flds) *1000, 0, 4);
+	   }
+	}
+     }
+   }
+   if ($ntpissystemd and (not $ntpischrony) ) {
+      if (!`systemctl status systemd-timesyncd | grep "Active: active (running)" | wc -l`) {
+         $bb->color_line('yellow', "Check NTP : systemctl status systemd-timesyncd\n\n");
+      }
+      @output = `timedatectl show-timesync 2>&1` or die ; # Un gars pas trop con a demande a Poettering de mettre une version facile a interpreter de la sortie de timedatectl (systemd issue 9249) et un miracle Perl mais les lignes dans un tableau
+      %tracking = map { s/\s+/ /g; s/^ //; chop; split(/=/,$_,2); } @output ; # un peu de magie Perl : map reproduit le bout de code pour chaque element du tableau, le bout de code donne 2 scalaires avec la limite sur la portee de la fonction split, scalaire qui sont manges comme de entrees du hash
+      if ( defined $tracking{"NTPMessage"} ) {
+         $tracking{NTPMessage} =~ s/^{ //;
+         $tracking{NTPMessage} =~ s/ }$//;
+         %NTPMessage = map { s/\s+/ /g; s/^ //; split(/=/,$_,2); } (split(/,/,$tracking{NTPMessage})); # un element du hash %tracking indexe par 'NTPMessage' contient la chaine de caracteres avec les elements d'info qui nous interesse, du coup nouveau hash pour que ce soit manipulable, attention la sortie de timedatectl semble foireuse car il n'y a pas de virgule pour 'Ignored=no PacketCount=95'
+      }
+      @output = `timedatectl timesync-status 2>&1` or die; # Helas, Poettering et ses potes connaissent pas tout et ils n'ont pas mis une representation NTP du temps precise pour les Timestamp pour calculer proprement delay, offset ... etc. Heureusement, ils ont laisses trainer leurs valeures deja machees dans la sortie utilisateur en CLI, donc surcharge de %tracking !
+      %tracking = map { s/\s+/ /g; s/^ //; chop ; split(/\:/,$_,2); } @output ;
+      
+      my $peer = $tracking{'Server'};
+      
+      $syspeer_stats->{'offset'} = conv2ms($tracking{'Offset'});
+      $syspeer_stats->{'delay'} = conv2ms($tracking{'Delay'});
+      $syspeer_stats->{'jitter'} = conv2ms($tracking{'Jitter'});
+      $syspeer_stats->{'status'} = $tracking{'Leap'};
+      if ($syspeer_stats->{'status'} =~ m/normal/) {
+         $bb->color_line('green', "Leap status: OK\n\n");
+      } else {
+         $bb->color_line('yellow', "Leap status: -$syspeer_stats->{'status'}-\n\n");
+      }
+      if (defined $tracking{'Server'}) { 
+	$found_syspeer = 1;
+      }
+      $bb->print("NTP peers: $peer\n\n");
+
+   }
 } else {
     if (-f $ntpd_pid_file) {
          $recently_started = (time - (stat($ntpd_pid_file))[9]) < 300;
@@ -128,6 +193,7 @@ if ($ntpischrony) {
         }
     }
 }
+
 if ($found_syspeer) {
 
     $bb->print( "\n" );
@@ -162,4 +228,3 @@ if ($found_syspeer) {
 
 #$trends->send;
 $bb->send;
-root@dc1tsde011:/usr/lib/xymon/client/ext#
