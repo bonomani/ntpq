@@ -1,5 +1,5 @@
 # ntpq
-Hobbit/Xymon NTPQ with Chrony and timedatectl/systemd-timesync support
+Hobbit/Xymon NTPQ with Chrony and Timedatectl/systemd-timesync support
 
 Add to the Hobbit/Xymon Plugin "ntpq" the comptatibility with "chronyd", "ntpd" should continue to work (not tested so far)
 
