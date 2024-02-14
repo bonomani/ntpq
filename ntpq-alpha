@@ -1,0 +1,214 @@
+#!/usr/bin/perl
+
+### This is an alpha version (but you can use it in production! This will not arm your system: replace orignal ntpq with this file)
+### - Restructure code to be cleaner: should work, but need to be tested!
+###  - Chrony tests result?
+###  - Ntp tests result?
+###  - Datectl tests result?
+
+
+# This script is a Hobbit client-side module to check the local ntpd daemon synchronization status.
+# It distinguishes between ntpd servers and clients, focusing on the latter.
+# It supports both chronyd and timedatectl as time synchronization services.
+# The script retrieves various metrics such as delay, offset, and jitter from the time synchronization services.
+
+# Copyright (C) 2008 Peter Eisentraut <petere@debian.org>
+# Copyright (C) 2024 Bonomani (Chrony Support and cleaning)
+# Copyright (C) 2023 Sylvain Maurin (Timedatectl Support)
+# Permission is hereby granted, free of charge, to any person
+# obtaining a copy of this software and associated documentation
+# files (the "Software"), to deal in the Software without
+# restriction, including without limitation the rights to use,
+# copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following
+# conditions:
+#
+# The above copyright notice and this permission notice shall be
+# included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+# OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+# OTHER DEALINGS IN THE SOFTWARE.
+
+use strict;
+use warnings;
+use Hobbit;
+use YAML::Tiny;
+
+my $test_name = 'ntpq';
+my $bb = new Hobbit($test_name);
+my $trends = Hobbit::trends;
+my $syspeer_stats = {};
+my $plugins_config = '/etc/xymon/plugins.yaml';
+my $ntpd_pid_file;
+my $offset_warning = 100;
+my $offset_critical = 2000;
+
+my $is_ntpq = is_command_available('/usr/bin/ntpq', 'ntpq -?');
+my $is_chronyd = is_command_available('/usr/sbin/chronyd', 'chronyc --help');
+my $is_timedatectl = is_command_available('/usr/bin/timedatectl', '/usr/bin/timedatectl --version');
+
+if ($is_chronyd) {
+    $ntpd_pid_file = '/var/run/chrony/chronyd.pid';
+    load_configuration_from_yaml();
+    handle_chronyd();
+} elsif ($is_ntpq) {
+    $ntpd_pid_file = '/var/run/ntpd.pid';
+    load_configuration_from_yaml();
+    handle_ntpd();
+} elsif ($is_timedatectl) {
+    ($ntpd_pid_file) = `systemctl show -p MainPID --value timedatectl` =~ /(\d+)/;
+    $ntpd_pid_file = "/proc/$ntpd_pid_file/stat";
+	load_configuration_from_yaml();
+    handle_timedatectl();
+} else {
+    # Error: No supported time synchronization service found
+}
+
+if ($syspeer_stats->{'found_syspeer'}) {
+    print_syspeer_info();
+} else {
+    print_no_syspeer_entry();
+}
+
+$bb->send;
+
+sub is_command_available {
+    my ($command, $check_command) = @_;
+    return -x $command && !system("$check_command >/dev/null 2>&1");
+}
+
+sub load_configuration_from_yaml {
+    if (-e $plugins_config) {
+        my $config_yaml = YAML::Tiny->read($plugins_config);
+        my $config = $config_yaml->[0]{$test_name};
+        if ($config) {
+            $ntpd_pid_file = $config->{ntpd_pid_file} if defined $config->{ntpd_pid_file};
+            $offset_warning = $config->{offset_warning} if defined $config->{offset_warning};
+            $offset_critical = $config->{offset_critical} if defined $config->{offset_critical};
+        }
+    }
+}
+
+sub handle_chronyd {
+    unless (`pgrep chronyd | wc -l`) {
+        $bb->color_line('yellow', "Chronyd process not found. Is chronyd running?\n\n");
+    }
+    my @output = `chronyc -m -n -c tracking sources sourcestats 2>&1` or die;
+    my @tracking = split(',', shift(@output));
+    my $peer = $tracking[1];
+    $syspeer_stats->{'offset'} = substr($tracking[5]*1000, 0, 4);
+    $syspeer_stats->{'delay'} = substr($tracking[10]*1000, 0, 4);
+    $syspeer_stats->{'status'} = pop @tracking;
+    chomp $syspeer_stats->{'status'};
+    $bb->color_line('green', "Leap status: " . ($syspeer_stats->{'status'} eq "Normal" ? "OK" : "-$syspeer_stats->{'status'}-") . "\n\n");
+    $bb->print("NTP peers:\n\n");
+    $bb->print("MS Name/IP address         Stratum Poll Reach LastRx\n");
+    $bb->print("======================================================\n");
+    foreach my $line (@output) {
+        my @flds = split(',', $line);
+        if ($flds[0] eq '^') {
+            my $new_line = $flds[0] . $flds[1] . $flds[2] . sprintf("%19s %3s %5s %5s", $flds[3], $flds[4], $flds[5], $flds[6]) . "\n";
+            $bb->color_line($flds[2] eq $peer ? 'green' : 'clear', $new_line);
+            $syspeer_stats->{'found_syspeer'} = 1 if $flds[2] eq $peer;
+        } elsif ($flds[0] eq $peer) {
+            $syspeer_stats->{'jitter'} = substr((pop @flds) * 1000, 0, 4);
+        }
+    }
+}
+
+sub handle_timedatectl {
+    unless (`systemctl status timedatectl | grep "Active: active (running)" | wc -l`) {
+        $bb->color_line('yellow', "Check NTP : systemctl status timedatectl\n\n");
+    }
+    my @output = `timedatectl show-timesync 2>&1` or die;
+    my %tracking = map { s/\s+/ /g; s/^ //; chop; split(/=/, $_, 2); } @output;
+    if (defined $tracking{"NTPMessage"}) {
+        $tracking{NTPMessage} =~ s/^{ //;
+        $tracking{NTPMessage} =~ s/ }$//;
+        my %NTPMessage = map { s/\s+/ /g; s/^ //; split(/=/, $_, 2); } (split(/,/, $tracking{NTPMessage}));
+    }
+    @output = `timedatectl timesync-status 2>&1` or die;
+    %tracking = map { s/\s+/ /g; s/^ //; chop; split(/:/, $_, 2); } @output;
+    my $peer = $tracking{'Server'};
+    $syspeer_stats->{'offset'} = convert_to_ms($tracking{'Offset'});
+    $syspeer_stats->{'delay'} = convert_to_ms($tracking{'Delay'});
+    $syspeer_stats->{'jitter'} = convert_to_ms($tracking{'Jitter'});
+    $syspeer_stats->{'status'} = $tracking{'Leap'};
+    $bb->color_line($syspeer_stats->{'status'} =~ m/normal/ ? 'green' : 'yellow', "Leap status: " . ($syspeer_stats->{'status'} =~ m/normal/ ? "OK" : "-$syspeer_stats->{'status'}-") . "\n\n");
+    $syspeer_stats->{'found_syspeer'} = 1 if defined $tracking{'Server'};
+    $bb->print("NTP peers: $peer\n\n");
+}
+
+sub handle_ntpd {
+    if (-f $ntpd_pid_file) {
+        $syspeer_stats->{'recently_started'} = (time - (stat($ntpd_pid_file))[9]) < 300;
+    } else {
+        $bb->color_line('yellow', "ntpd pid file $ntpd_pid_file not found. Is ntpd running?\n\n");
+    }
+    my @output = `ntpq -np 2>&1` or die;
+    $bb->print("NTP peers:\n\n");
+    foreach my $line (@output) {
+        if ($line =~ /^  / or $line =~ /^==/) {
+            $bb->print('   ' . $line);
+        } elsif ($line =~ /^\*\S+\s+\S+\s+\d+ \w\s+[\dm-]+\s+[\d-]+\s+[\d-]+\s+([\d\.-]+)\s+([-\d\.+]+)\s+([\d\.-]+)/) {
+            ($syspeer_stats->{'delay'}, $syspeer_stats->{'offset'}, $syspeer_stats->{'jitter'}) = ($1, $2, $3);
+            $bb->color_line('green', $line);
+            $syspeer_stats->{'found_syspeer'} = 1;
+        } elsif ($line =~ /^( |x|\.|\-|\+|\#|o)/) {
+            $bb->color_line('clear', $line);
+            $syspeer_stats->{'initializing'} = 1 if $line =~ /\.INIT\.|\.STEP\./;
+        } else {
+            $bb->color_line('yellow', $line);
+        }
+    }
+}
+
+sub convert_to_ms {
+    my ($to_convert) = @_;
+    return -1 unless defined $to_convert;
+    my $ms_result = -1;
+    if ($to_convert =~ m/([-+.\d]+)(us|ms|s)$/) {
+        $ms_result = $1;
+        $ms_result /= 1000 if $2 eq 'us';  # Convert microseconds to milliseconds
+        $ms_result *= 1000 if $2 eq 's';   # Convert seconds to milliseconds
+    }
+    return $ms_result;
+}
+
+sub print_syspeer_info {
+    $bb->print("\n");
+    $bb->print("SyspeerDelay: $syspeer_stats->{'delay'}\n");
+    $bb->print("SyspeerOffset: $syspeer_stats->{'offset'}\n");
+    $bb->print("SyspeerJitter: $syspeer_stats->{'jitter'}\n\n");
+    $bb->print("SyspeerOffset thresholds:\n");
+    $bb->print("Warning: ${offset_warning}ms\n");
+    $bb->print("Critical: ${offset_critical}ms\n");
+    my $offset = abs($syspeer_stats->{'offset'});
+    if ($offset > $offset_critical) {
+        $bb->color_line('red', "SyspeerOffset > ${offset_critical}ms\n");
+    } elsif ($offset > $offset_warning) {
+        $bb->color_line('yellow', "SyspeerOffset > ${offset_warning}ms\n");
+    }
+    $trends->print("[${test_name},SyspeerDelay.rrd]\n");
+    $trends->print("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'delay'}\n");
+    $trends->print("[${test_name},SyspeerOffset.rrd]\n");
+    $trends->print("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'offset'}\n");
+    $trends->print("[${test_name},SyspeerJitter.rrd]\n");
+    $trends->print("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'jitter'}\n");
+}
+
+sub print_no_syspeer_entry {
+    $bb->print("\n");
+    if ($syspeer_stats->{'recently_started'} && $syspeer_stats->{'initializing'}) {
+        $bb->color_line('yellow', "No system peer entry (\"*\") found; ntpd was recently started and is initializing.\n");
+    } else {
+        $bb->color_line('red', "No system peer entry (\"*\") found\n");
+    }
+}
