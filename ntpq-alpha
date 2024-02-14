@@ -65,7 +65,7 @@ if ($is_chronyd) {
 } elsif ($is_timedatectl) {
     ($ntpd_pid_file) = `systemctl show -p MainPID --value timedatectl` =~ /(\d+)/;
     $ntpd_pid_file = "/proc/$ntpd_pid_file/stat";
-	load_configuration_from_yaml();
+    load_configuration_from_yaml();
     handle_timedatectl();
 } else {
     # Error: No supported time synchronization service found
