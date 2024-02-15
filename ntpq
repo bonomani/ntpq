@@ -110,18 +110,36 @@ sub handle_chronyd {
     $syspeer_stats->{'status'} = pop @tracking;
     chomp $syspeer_stats->{'status'};
     $bb->color_line('green', "Leap status: " . ($syspeer_stats->{'status'} eq "Normal" ? "OK" : "-$syspeer_stats->{'status'}-") . "\n\n");
-    $bb->print("NTP peers:\n\n");
-    $bb->print("MS Name/IP address         Stratum Poll Reach LastRx\n");
-    $bb->print("======================================================\n");
+    $bb->print("NTP Master: $peer\n\n");
+    $bb->print("   Name/IP address         Stratum Poll Reach     LastRx\n");
+    $bb->print("========================================================\n");
+    my $valid_ntp_peer = 0;
     foreach my $line (@output) {
         my @flds = split(',', $line);
         if ($flds[0] eq '^') {
-            my $new_line = $flds[0] . $flds[1] . $flds[2] . sprintf("%19s %3s %5s %5s", $flds[3], $flds[4], $flds[5], $flds[6]) . "\n";
-            $bb->color_line($flds[2] eq $peer ? 'green' : 'clear', $new_line);
+            my $new_line;
+            if ($flds[2] eq $peer) {
+                $new_line = $flds[2] . sprintf("%21s %4s %5s %10s", $flds[3], $flds[4], $flds[5], $flds[6]) . "\n";
+            } else {
+                $new_line = $flds[2] . sprintf("%21s %4s %5s %10s", $flds[3], $flds[4], $flds[5], $flds[6]) . "\n";
+            }
+            if ($flds[5] eq '377') {
+                $valid_ntp_peer++;
+                $bb->color_line('green', $new_line);
+            } else {
+                $bb->color_line('clear', $new_line);
+            }
             $syspeer_stats->{'found_syspeer'} = 1 if $flds[2] eq $peer;
         } elsif ($flds[0] eq $peer) {
             $syspeer_stats->{'jitter'} = substr((pop @flds) * 1000, 0, 4);
         }
+    }
+    $bb->print("\n");
+    my $new_line = "Nb of valid peers: $valid_ntp_peer";
+    if ($valid_ntp_peer < 2 ) {
+        $bb->color_line('yellow', $new_line);
+    } else {
+        $bb->color_line('green', $new_line);
     }
 }
 
