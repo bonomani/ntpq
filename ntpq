@@ -112,7 +112,7 @@ sub handle_chronyd {
     $bb->print("NTP Master: $peer\n\n");
     $bb->print("   Name/IP address         Stratum Poll Reach     LastRx\n");
     $bb->print("========================================================\n");
-    my $valid_ntp_peer = 0;
+    my $valid_ntp_peers = 0;
     foreach my $line (@output) {
         my @flds = split(',', $line);
         if ($flds[0] eq '^') {
@@ -123,10 +123,10 @@ sub handle_chronyd {
                 $new_line = $flds[2] . sprintf("%21s %4s %5s %10s", $flds[3], $flds[4], $flds[5], $flds[6]) . "\n";
             }
             if ($flds[5] eq '377') {
-                $valid_ntp_peer++;
+                $valid_ntp_peers++;
                 $bb->color_line('green', $new_line);
             } else {
-                $bb->color_line('clear', $new_line);
+                $bb->print('&red '.$new_line); # Use print as I do not want to propaget the error
             }
             $syspeer_stats->{'found_syspeer'} = 1 if $flds[2] eq $peer;
         } elsif ($flds[0] eq $peer) {
@@ -134,8 +134,10 @@ sub handle_chronyd {
         }
     }
     $bb->print("\n");
-    my $new_line = "Nb of valid peers: $valid_ntp_peer";
-    if ($valid_ntp_peer < 2 ) {
+    my $new_line = "Nb of valid peers: $valid_ntp_peers";
+    if ($valid_ntp_peers == 0 ) {
+        $bb->color_line('red', $new_line);
+    } elsif ($valid_ntp_peers == 1 ) {
         $bb->color_line('yellow', $new_line);
     } else {
         $bb->color_line('green', $new_line);
