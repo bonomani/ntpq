@@ -3,7 +3,6 @@
 ### This is an alpha version (but you can use it in production! This will not arm your system: replace orignal ntpq with this file)
 ### - Restructure code to be cleaner: should work, but need to be tested!
 ###  - Chrony tests result: OK
-###    - Possible improvement: Check if all peer are reachable warn with yellow
 ###  - Ntpd tests result?
 ###  - Datectl tests result?
 ###  - Globally: Trends not used (no more RRD : is that usefull? if not remove the code)
