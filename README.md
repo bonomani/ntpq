@@ -4,6 +4,7 @@ Hobbit/Xymon NTPQ with Chrony and Timedatectl/systemd-timesync support
 Add to the Hobbit/Xymon Plugin "ntpq" the comptatibility with "chronyd", "ntpd" should continue to work (not tested so far)
 
 Tested on debian 11,12 chrony v4.0
+- Last Update 15.02.2024: Restructure the code
 
 How to install 
 - Install Xymon Client (should have already): apt install xymon-client
