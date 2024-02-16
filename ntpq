@@ -126,7 +126,7 @@ sub handle_chronyd {
                 $valid_ntp_peers++;
                 $bb->color_line('green', $new_line);
             } else {
-                $bb->print('&red '.$new_line); # Use print as I do not want to propaget the error
+                $bb->print('&red '.$new_line); # Use print as I do not want to propagate the error
             }
             $syspeer_stats->{'found_syspeer'} = 1 if $flds[2] eq $peer;
         } elsif ($flds[0] eq $peer) {
