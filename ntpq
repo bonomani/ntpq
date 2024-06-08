@@ -104,8 +104,8 @@ sub handle_chronyd {
     my @output = `chronyc -m -n -c tracking sources sourcestats 2>&1` or die;
     my @tracking = split(',', shift(@output));
     my $peer = $tracking[1];
-    $syspeer_stats->{'offset'} = substr($tracking[5]*1000, 0, 4);
-    $syspeer_stats->{'delay'} = substr($tracking[10]*1000, 0, 4);
+    $syspeer_stats->{'offset'} = sprintf("%.4f", $tracking[5] * 1000);
+    $syspeer_stats->{'delay'} = sprintf("%.4f", $tracking[10] * 1000);
     $syspeer_stats->{'status'} = pop @tracking;
     chomp $syspeer_stats->{'status'};
     $bb->color_line('green', "Leap status: " . ($syspeer_stats->{'status'} eq "Normal" ? "OK" : "-$syspeer_stats->{'status'}-") . "\n\n");
