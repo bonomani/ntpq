@@ -477,7 +477,7 @@ sub handle_timedatectl {
     my ($config) = @_;
     my %thresholds = (
         offset_warning  => $config->{timedatectl_offset_warning}  // 0.1,  # Default: 0.1 seconds
-        offset_critical => $config->{timedatectl_offset_critical} // 0.5,  # Default: 0.5 seconds
+        offset_critical => $config->{timedatectl_offset_critical} // 0.2,  # Default: 0.2 seconds
     );
 
     unless (`systemctl status timedatectl | grep "Active: active (running)" | wc -l`) {
