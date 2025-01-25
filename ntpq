@@ -332,12 +332,18 @@ sub handle_chronyd {
 
     # Parse global tracking information (Line 1)
     my @tracking = split(',', shift(@output));
-    my $peer = $tracking[1] // 'Unknown';
+    my $peer = (defined $tracking[1] && $tracking[1] ne '') ? $tracking[1] : 'Unknown';
     my $offset = $tracking[5] // 0;
     my $delay = $tracking[10] // 0;
     my $jitter = $tracking[6] // 0;
     my $leap_status = $tracking[-1] // 'Unknown';
     $leap_status =~ s/[^a-zA-Z0-9]//g;
+
+    # Determine NTP Master status
+    my $ntp_master_status = ($peer eq 'Unknown' ) ? 'red' : 'green';
+
+    # Determine Leap Status
+    my $leap_status_color = ($leap_status eq 'Notsynchronised') ? 'red' : 'green';
 
     # Use evaluate_threshold for global metrics
     my $global_metrics = {
@@ -348,8 +354,8 @@ sub handle_chronyd {
 
     # Build and print global metrics
     my @global_output = (
-        sprintf("NTP Master    : %s", color_text(($peer eq 'Unknown') ? 'red' : 'green', $peer)),
-        sprintf("   Leap Status   : %s", color_text('green', $leap_status)),
+        sprintf("NTP Master    : %s", color_text($ntp_master_status, $peer)),
+        sprintf("   Leap Status   : %s", color_text($leap_status_color, $leap_status)),
         sprintf("   Syspeer Offset: %s", color_text($global_metrics->{offset}, join('', format_time($offset)))),
         sprintf("   Syspeer Delay : %s", color_text($global_metrics->{delay}, join('', format_time($delay)))),
         sprintf("   Syspeer Jitter: %s", color_text($global_metrics->{jitter}, join('', format_time($jitter)))),
