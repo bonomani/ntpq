@@ -1,12 +1,11 @@
 #!/usr/bin/perl
 
-### This is an alpha version (but you can use it in production! This will not arm your system: replace orignal ntpq with this file)
-### - Restructure code to be cleaner: should work, but need to be tested!
+### This is an alpha version (but you can use it in production! This will not arm your system: replace original ntpq with this file)
+### - Restructure code to be cleaner: should work, but needs to be tested!
 ###  - Chrony tests result: OK
 ###  - Ntpd tests result?
 ###  - Datectl tests result?
-###  - Globally: Trends not used (no more RRD : is that usefull? if not remove the code)
-
+###  - Globally: Trends not used (no more RRD : is that useful? if not remove the code)
 
 # This script is a Hobbit client-side module to check the local ntpd daemon synchronization status.
 # It distinguishes between ntpd servers and clients, focusing on the latter.
@@ -14,7 +13,7 @@
 # The script retrieves various metrics such as delay, offset, and jitter from the time synchronization services.
 
 # Copyright (C) 2008 Peter Eisentraut <petere@debian.org>
-# Copyright (C) 2024 Bonomani (Chrony Support and cleaning)
+# Copyright (C) 2025 Bonomani (Chrony Support and cleaning)
 # Copyright (C) 2023 Sylvain Maurin (Timedatectl Support)
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation
@@ -41,195 +40,587 @@ use strict;
 use warnings;
 use Hobbit;
 use YAML::Tiny;
+use open qw(:std :utf8);
 
 my $test_name = 'ntpq';
 my $bb = new Hobbit($test_name);
 my $trends = Hobbit::trends;
 my $syspeer_stats = {};
 my $plugins_config = '/etc/xymon/plugins.yaml';
-my $ntpd_pid_file;
-my $offset_warning = 100;
-my $offset_critical = 2000;
 
-my $is_ntpq = is_command_available('/usr/bin/ntpq', 'ntpq -?');
-my $is_chronyd = is_command_available('/usr/sbin/chronyd', 'chronyc --help');
-my $is_timedatectl = is_command_available('/usr/bin/timedatectl', '/usr/bin/timedatectl --version');
+my $systemctl_path = find_command('systemctl'); # Ajouté pour résoudre l'erreur
+my $ntpd_pid_file;                             # Variable globale déclarée
+my $offset_warning;                            # Ajout de la déclaration explicite
+my $offset_critical;                           # Ajout de la déclaration explicite
+
+# Check which time synchronization service is available
+my $ntpq_path = find_command('ntpq');
+my $chronyd_path = find_command('chronyd');
+my $timedatectl_path = find_command('timedatectl');
+
+my $is_ntpq = $ntpq_path && is_command_available($ntpq_path, "$ntpq_path -?");
+my $is_chronyd = $chronyd_path && is_command_available($chronyd_path, "$chronyd_path --help");
+my $is_timedatectl = $timedatectl_path && is_command_available($timedatectl_path, "$timedatectl_path --version");
 
 if ($is_chronyd) {
-    $ntpd_pid_file = '/var/run/chrony/chronyd.pid';
-    load_configuration_from_yaml();
-    handle_chronyd();
+    handle_chronyd(load_configuration_from_yaml($test_name));
 } elsif ($is_ntpq) {
-    $ntpd_pid_file = '/var/run/ntpd.pid';
-    load_configuration_from_yaml();
-    handle_ntpd();
+    handle_ntpd(load_configuration_from_yaml($test_name));
 } elsif ($is_timedatectl) {
-    ($ntpd_pid_file) = `systemctl show -p MainPID --value timedatectl` =~ /(\d+)/;
-    $ntpd_pid_file = "/proc/$ntpd_pid_file/stat";
-    load_configuration_from_yaml();
-    handle_timedatectl();
+    handle_timedatectl(load_configuration_from_yaml($test_name));
 } else {
-    # Error: No supported time synchronization service found
-}
-
-if ($syspeer_stats->{'found_syspeer'}) {
-    print_syspeer_info();
-} else {
-    print_no_syspeer_entry();
+    $bb->color_line('red', "No supported time synchronization service found. Exiting...\n");
+    exit 1;
 }
 
 $bb->send;
 
+# Check if a command is available on the system
 sub is_command_available {
     my ($command, $check_command) = @_;
-    return -x $command && !system("$check_command >/dev/null 2>&1");
+    return $command && -x $command && !system("$check_command >/dev/null 2>&1");
+}
+
+
+# Find a command in the system PATH
+sub find_command {
+    my ($command) = @_;
+    foreach my $dir (split /:/, $ENV{PATH}) {
+        my $path = "$dir/$command";
+        return $path if -x $path;
+    }
+    return undef;
+}
+
+
+# Evaluate thresholds for warnings and critical alerts
+sub evaluate_threshold1 {
+    my ($value, $warning, $critical) = @_;
+    my $abs_value = abs($value);  # Use absolute value for comparison
+    return 'red' if $abs_value >= $critical;
+    return 'yellow' if $abs_value >= $warning;
+    return 'green';
+}
+
+sub evaluate_threshold {
+    my ($value, $warning, $critical, $sign) = @_;
+
+    # Default sign is '>=' (greater-than or equal-to)
+    $sign //= '>=';
+
+    # Check if thresholds are defined and perform comparisons
+    if (defined $critical) {
+        if ($sign eq '>=') {
+            return 'red' if $value >= $critical;
+        } elsif ($sign eq '<=') {
+            return 'red' if $value <= $critical;
+        } elsif ($sign eq '>') {
+            return 'red' if $value > $critical;
+        } elsif ($sign eq '<') {
+            return 'red' if $value < $critical;
+        } elsif ($sign eq '==') {
+            return 'red' if $value == $critical;
+        }
+    }
+
+    if (defined $warning) {
+        if ($sign eq '>=') {
+            return 'yellow' if $value >= $warning;
+        } elsif ($sign eq '<=') {
+            return 'yellow' if $value <= $warning;
+        } elsif ($sign eq '>') {
+            return 'yellow' if $value > $warning;
+        } elsif ($sign eq '<') {
+            return 'yellow' if $value < $warning;
+        } elsif ($sign eq '==') {
+            return 'yellow' if $value == $warning;
+        }
+    }
+
+    # Default to green if no thresholds are defined or conditions are met
+    return 'green';
+}
+
+sub evaluate_abs_threshold {
+    my ($value, $warning, $critical, $sign) = @_;
+
+    # Calculate the absolute value
+    my $abs_value = abs($value);
+
+    # Delegate the comparison to evaluate_threshold
+    return evaluate_threshold($abs_value, $warning, $critical, $sign);
+}
+
+sub evaluate_threshold_rule {
+    my ($value, $threshold) = @_;
+
+    # Extract warning, critical, and operator
+    my $warning  = $threshold->{warning};
+    my $critical = $threshold->{critical};
+    my $operator = $threshold->{operator};
+
+    # Use evaluate_threshold with extracted values
+    return evaluate_threshold($value, $warning, $critical, $operator);
+}
+
+sub color_text {
+    my ($color, $text) = @_;
+    return "&$color $text";  # Adjust to your color tagging format
+}
+
+# Function to compute the worst (highest severity) color
+sub get_worst_color_from_text {
+    my ($text) = @_;
+    my %color_priority = (
+        clear  => 0,
+        green  => 1,
+        yellow => 2,
+        red    => 3,
+    );
+
+    # Extract all colors from the text using regex
+    my @colors = ($text =~ /&(\w+)\s/g);
+
+    # Find the worst color based on priority
+    my $worst_color = 'clear';  # Default to lowest severity
+    foreach my $color (@colors) {
+        if (exists $color_priority{$color} && $color_priority{$color} > $color_priority{$worst_color}) {
+            $worst_color = $color;
+        }
+    }
+    return $worst_color;
 }
 
 sub load_configuration_from_yaml {
+    my ($test_name) = @_;
+
+    # Initialize configuration hash
+    my %config;
+
+    # Check if the YAML configuration file exists
     if (-e $plugins_config) {
         my $config_yaml = YAML::Tiny->read($plugins_config);
-        my $config = $config_yaml->[0]{$test_name};
-        if ($config) {
-            $ntpd_pid_file = $config->{ntpd_pid_file} if defined $config->{ntpd_pid_file};
-            $offset_warning = $config->{offset_warning} if defined $config->{offset_warning};
-            $offset_critical = $config->{offset_critical} if defined $config->{offset_critical};
+        my $yaml_config = $config_yaml->[0]{$test_name};
+
+        # Update configuration values if they are defined in the YAML
+        if ($yaml_config) {
+            $config{ntpd_pid_file}             = $yaml_config->{ntpd_pid_file}             if defined $yaml_config->{ntpd_pid_file};
+
+            # Timedatectl specific thresholds
+            $config{timedatectl_offset_warning}  = $yaml_config->{timedatectl_offset_warning} / 1000  if defined $yaml_config->{timedatectl_offset_warning};
+            $config{timedatectl_offset_critical} = $yaml_config->{timedatectl_offset_critical} / 1000 if defined $yaml_config->{timedatectl_offset_critical};
+
+            # NTPd specific thresholds
+            $config{ntpd_offset_warning}         = $yaml_config->{ntpd_offset_warning} / 1000         if defined $yaml_config->{ntpd_offset_warning};
+            $config{ntpd_offset_critical}        = $yaml_config->{ntpd_offset_critical} / 1000        if defined $yaml_config->{ntpd_offset_critical};
+            $config{ntpd_jitter_warning}         = $yaml_config->{ntpd_jitter_warning} / 1000         if defined $yaml_config->{ntpd_jitter_warning};
+            $config{ntpd_jitter_critical}        = $yaml_config->{ntpd_jitter_critical} / 1000        if defined $yaml_config->{ntpd_jitter_critical};
+            $config{ntpd_delay_warning}          = $yaml_config->{ntpd_delay_warning} / 1000          if defined $yaml_config->{ntpd_delay_warning};
+            $config{ntpd_delay_critical}         = $yaml_config->{ntpd_delay_critical} / 1000         if defined $yaml_config->{ntpd_delay_critical};
+
+            # Chrony peer-specific thresholds
+            $config{peer_chronyd_offset_warning}  = $yaml_config->{chronyd_peer_offset_warning} / 1000  if defined $yaml_config->{chronyd_peer_offset_warning};
+            $config{peer_chronyd_offset_critical} = $yaml_config->{chronyd_peer_offset_critical} / 1000 if defined $yaml_config->{chronyd_peer_offset_critical};
+            $config{peer_chronyd_jitter_warning}  = $yaml_config->{chronyd_peer_jitter_warning} / 1000  if defined $yaml_config->{chronyd_peer_jitter_warning};
+            $config{peer_chronyd_jitter_critical} = $yaml_config->{chronyd_peer_jitter_critical} / 1000 if defined $yaml_config->{chronyd_peer_jitter_critical};
+            $config{peer_chronyd_reachability_pct_warning} = $yaml_config->{peer_chronyd_reachability_pct_warning}         if defined $yaml_config->{peer_chronyd_reachability_pct_warning};
+            $config{peer_chronyd_last_rx_warning}  = $yaml_config->{chronyd_last_rx_warning}           if defined $yaml_config->{chronyd_last_rx_warning};
+            $config{peer_chronyd_last_rx_critical} = $yaml_config->{chronyd_last_rx_critical}          if defined $yaml_config->{chronyd_last_rx_critical};
+
+            # Chrony common thresholds
+            $config{chronyd_stratum_critical} = $yaml_config->{chronyd_stratum_critical} if defined $yaml_config->{chronyd_stratum_critical};
         }
     }
+
+    # Return the configuration
+    return \%config;
+}
+
+sub format_time {
+    my ($value) = @_;
+    my ($formatted_value, $unit);
+
+    if (abs($value) >= 1) {
+        # Handle seconds
+        $formatted_value = sprintf("%.1f", $value);  # Seconds
+        $unit = "s ";
+    } elsif (abs($value) >= 0.001) {
+        # Handle milliseconds
+        $formatted_value = sprintf("%.1f", $value * 1000);  # Milliseconds
+        $unit = "ms";
+    } else {
+        # Handle microseconds
+        $formatted_value = sprintf("%.1f", $value * 1_000_000);  # Microseconds
+        $unit = "&micro;s";  # Unicode for µs
+    }
+
+    return ($formatted_value, $unit);
+}
+
+# Simplified reach conversion
+sub convert_reach_to_percentage {
+    my ($reach_octal) = @_;
+    my $reach_decimal = oct($reach_octal);  # Convert octal to decimal
+    my $success_count = sprintf("%b", $reach_decimal) =~ tr/1//;  # Count 1's in binary
+    return ($success_count * 12.5);  # Each successful poll is 12.5%
 }
 
 sub handle_chronyd {
-    unless (`pgrep chronyd | wc -l`) {
+    my ($config) = @_;
+
+    # Set alerting thresholds, falling back to defaults if not in config
+        my %thresholds = (
+                # Global thresholds
+                global_offset => {
+                        warning  => $config->{chronyd_global_offset_warning}  // 0.05,
+                        critical => $config->{chronyd_global_offset_critical} // 0.2,
+                        operator => '>=',  # Default: greater than or equal
+                },
+                global_jitter => {
+                        warning  => $config->{chronyd_global_jitter_warning}  // 0.01,
+                        critical => $config->{chronyd_global_jitter_critical} // 0.05,
+                        operator => '>=',
+                },
+                global_delay => {
+                        warning  => $config->{chronyd_global_delay_warning}   // 0.1,
+                        critical => $config->{chronyd_global_delay_critical}  // 0.5,
+                        operator => '>=',
+                },
+
+                # Peer-specific thresholds
+                peer_offset => {
+                        warning  => $config->{chronyd_peer_offset_warning}    // 0.1,
+                        critical => $config->{chronyd_peer_offset_critical}   // 0.4,
+                        operator => '>=',
+                },
+                peer_jitter => {
+                        warning  => $config->{chronyd_peer_jitter_warning}    // 0.05,
+                        critical => $config->{chronyd_peer_jitter_critical}   // 0.1,
+                        operator => '>=',
+                },
+                peer_reachability_pct => {
+                        warning  => $config->{chronyd_reachability_pct_warning} // 100, # Only critical for good reachability
+                        critical => undef,  # Not applicable
+                        operator => '<',
+                },
+                peer_last_rx => {
+                        warning  => $config->{chronyd_last_rx_warning}        // 64,
+                        critical => $config->{chronyd_last_rx_critical}       // 128,
+                        operator => '>=',
+                },
+
+                # Common thresholds
+                stratum => {
+                        warning  => undef,  # Not applicable
+                        critical => $config->{chronyd_stratum_critical}       // 16,
+                        operator => '>=',
+                },
+        );
+
+    # Check if chronyd process is running
+    unless (`pgrep chronyd | wc -l` > 0) {
         $bb->color_line('yellow', "Chronyd process not found. Is chronyd running?\n\n");
+        return;
     }
-    my @output = `chronyc -m -n -c tracking sources sourcestats 2>&1` or die;
+
+    # Execute chronyc command
+    my @output = `chronyc -m -n -c tracking sources sourcestats 2>&1`;
+    if ($? != 0 || !@output) {
+        $bb->color_line('red', "Failed to execute 'chronyc' command. Check chronyd status.\n\n");
+        return;
+    }
+
+    # Parse global tracking information (Line 1)
     my @tracking = split(',', shift(@output));
-    my $peer = $tracking[1];
-    $syspeer_stats->{'offset'} = sprintf("%.4f", $tracking[5] * 1000);
-    $syspeer_stats->{'delay'} = sprintf("%.4f", $tracking[10] * 1000);
-    $syspeer_stats->{'status'} = pop @tracking;
-    chomp $syspeer_stats->{'status'};
-    $bb->color_line('green', "Leap status: " . ($syspeer_stats->{'status'} eq "Normal" ? "OK" : "-$syspeer_stats->{'status'}-") . "\n\n");
-    $bb->print("NTP Master: $peer\n\n");
-    $bb->print("   Name/IP address         Stratum Poll Reach     LastRx\n");
-    $bb->print("========================================================\n");
-    my $valid_ntp_peers = 0;
+    my $peer = $tracking[1] // 'Unknown';
+    my $offset = $tracking[5] // 0;
+    my $delay = $tracking[10] // 0;
+    my $jitter = $tracking[6] // 0;
+    my $leap_status = $tracking[-1] // 'Unknown';
+    $leap_status =~ s/[^a-zA-Z0-9]//g;
+
+    # Use evaluate_threshold for global metrics
+    my $global_metrics = {
+        offset => evaluate_threshold_rule(abs($offset), $thresholds{global_offset}),
+        jitter => evaluate_threshold_rule(abs($jitter), $thresholds{global_jitter}),
+        delay  => evaluate_threshold_rule(abs($delay), $thresholds{global_delay}),
+    };
+
+    # Build and print global metrics
+    my @global_output = (
+        sprintf("NTP Master    : %s", color_text(($peer eq 'Unknown') ? 'red' : 'green', $peer)),
+        sprintf("   Leap Status   : %s", color_text('green', $leap_status)),
+        sprintf("   Syspeer Offset: %s", color_text($global_metrics->{offset}, join('', format_time($offset)))),
+        sprintf("   Syspeer Delay : %s", color_text($global_metrics->{delay}, join('', format_time($delay)))),
+        sprintf("   Syspeer Jitter: %s", color_text($global_metrics->{jitter}, join('', format_time($jitter)))),
+    );
+
+    my $worst_global_color = get_worst_color_from_text(join("\n", @global_output));
+    $bb->print(color_text($worst_global_color, join("\n", @global_output)) . "\n");
+
+    # Peer-specific data
+    $bb->print("\nPeers:\n");
+    $bb->print("Not alarming on any specific peer value, for info only\n\n");
+    $bb->print("    Address              Stratum PollRate Reach(Pct)   LastRx    Offset      Jitter\n");
+    $bb->print(" ---------------------------------------------------------------------------------------\n");
+
+    my $valid_peers = 0;
     foreach my $line (@output) {
-        my @flds = split(',', $line);
-        if ($flds[0] eq '^') {
-            my $new_line;
-            if ($flds[2] eq $peer) {
-                $new_line = $flds[2] . sprintf("%21s %4s %5s %10s", $flds[3], $flds[4], $flds[5], $flds[6]) . "\n";
-            } else {
-                $new_line = $flds[2] . sprintf("%21s %4s %5s %10s", $flds[3], $flds[4], $flds[5], $flds[6]) . "\n";
-            }
-            if ($flds[5] eq '377') {
-                $valid_ntp_peers++;
-                $bb->color_line('green', $new_line);
-            } else {
-                $bb->print('&red '.$new_line); # Use print as I do not want to propagate the error
-            }
-            $syspeer_stats->{'found_syspeer'} = 1 if $flds[2] eq $peer;
-        } elsif ($flds[0] eq $peer) {
-            $syspeer_stats->{'jitter'} = substr((pop @flds) * 1000, 0, 4);
-        }
+        my @fields = split(',', $line);
+
+        my ($peer_type, $peer_flag, $peer_name, $stratum, $poll_rate_exp, $reach, $last_rx, $offset, $jitter) = @fields;
+
+        # Skip line if $peer_type has more than one character
+        next if length($peer_type) > 1;
+
+        # Increment valid peer count for active peers
+        $valid_peers++ if $peer_type eq '^';
+
+        $peer_name //= 'Unknown';
+        $stratum //= 16;
+        $poll_rate_exp //= 0;
+        $reach //= '0';
+        $last_rx //= '-';
+        $offset //= 0;
+        $jitter //= 0;
+
+        # Format metrics
+        my ($offset_numeric, $offset_unit) = format_time($offset);
+        my ($jitter_numeric, $jitter_unit) = format_time($jitter);
+        my ($last_rx_numeric, $last_rx_unit) = ($last_rx ne '-') ? format_time($last_rx) : ('', '');
+
+        my $reach_percentage = convert_reach_to_percentage($reach);
+        #my $reach_status = ($reach_percentage < $thresholds{peer_reachability_od}) ? 'yellow' : 'green';
+        my $reach_status = evaluate_threshold_rule($reach_percentage, $thresholds{peer_reachability_pct});
+
+        # Evaluate peer-specific metrics
+        my $peer_metrics = {
+            offset => evaluate_threshold_rule(abs($offset), $thresholds{peer_offset}),
+            jitter => evaluate_threshold_rule(abs($jitter), $thresholds{peer_jitter}),
+            last_rx => ($last_rx ne '-') ? evaluate_threshold_rule($last_rx, $thresholds{peer_last_rx}) : 'green',
+        };
+
+        $bb->print(sprintf(" %1s%1s %-20s ", $peer_type, $peer_flag, $peer_name));
+        my $stratum_status = evaluate_threshold_rule($stratum, $thresholds{stratum});
+        $bb->color_line($stratum_status, sprintf("%4s ", $stratum // 'N/A'));
+        $bb->print(sprintf("%7.1fs ", 2**$poll_rate_exp));
+        $bb->color_line($reach_status, sprintf("%8s ", sprintf("%3s(%3.0f%%)", $reach, $reach_percentage)));
+        $bb->color_line($peer_metrics->{last_rx}, sprintf("%4s", $last_rx_numeric) . $last_rx_unit . " ");
+        $bb->color_line($peer_metrics->{offset}, sprintf("%6s", $offset_numeric) . $offset_unit . " ");
+        $bb->color_line($peer_metrics->{jitter}, sprintf("%6s", $jitter_numeric) . $jitter_unit . "\n");
     }
+
+    # Peer summary
+    my $peer_summary = "Nb of valid peers: $valid_peers";
+    my $peer_summary_status = ($valid_peers == 0) ? 'red' : ($valid_peers == 1) ? 'yellow' : 'green';
     $bb->print("\n");
-    my $new_line = "Nb of valid peers: $valid_ntp_peers";
-    if ($valid_ntp_peers == 0 ) {
-        $bb->color_line('red', $new_line);
-    } elsif ($valid_ntp_peers == 1 ) {
-        $bb->color_line('yellow', $new_line);
-    } else {
-        $bb->color_line('green', $new_line);
-    }
+    $bb->color_line($peer_summary_status, $peer_summary . "\n");
+    $bb->print("\n");
+
+        # Print Threshold Summary
+        $bb->print("Thresholds:\n");
+
+        my $max_label_length = 18; # Adjusted for longer threshold names
+
+        foreach my $key (sort keys %thresholds) {
+                my $threshold = $thresholds{$key};
+
+                # Skip if no threshold is defined
+                next unless $threshold && ref($threshold) eq 'HASH';
+
+                # Transform the key to a human-readable format
+                my $readable_key = $key;
+                my $unit = '';  # Initialize unit as empty
+
+                # Check for and handle keys ending with 'pct'
+                if ($readable_key =~ s/_pct$//i) {  # Remove '_pct' (case-insensitive) from the key
+                        $unit = '%';                    # Set the unit to '%'
+                }
+
+                # Replace underscores with spaces and capitalize the first word only
+                $readable_key =~ s/_/ /g;           # Replace underscores with spaces
+                $readable_key = lc($readable_key);  # Convert to lowercase
+                $readable_key = ucfirst($readable_key);  # Capitalize the first word
+
+                # Extract values from the threshold rule
+                my $warning  = $threshold->{warning}  // '';
+                my $critical = $threshold->{critical} // '';
+                my $operator = $threshold->{operator} // '>=';
+
+                # Format time-based thresholds or append the unit if applicable
+                foreach my $value (\$warning, \$critical) {
+                        if ($readable_key =~ /(?:Offset|Jitter|Delay|Last RX)$/i && $$value ne '') {
+                                my ($time, $unit) = format_time($$value);
+                                $$value = sprintf("%5s", $time) . sprintf("%-2s",$unit);  # Combine numeric value and time unit
+                        } elsif ($$value =~ /^[+-]?\d+$/ ) {
+                $$value = sprintf("%3s  ", $$value) . sprintf("%-2s",$unit);
+                        }
+                }
+
+                # Prepare parts to print
+                my @parts;
+                push @parts, "Oper ". sprintf("%-2s", $operator);
+                push @parts, sprintf("Warn %s", $warning) if $warning ne '';
+                push @parts, sprintf("Crit %s", $critical) if $critical ne '';
+
+                # Print the threshold summary for this key
+                if (@parts) {
+                        $bb->print(sprintf("  %-*s %s\n", $max_label_length, $readable_key . ':', join('  ', @parts)));
+                }
+        }
+
+    $bb->print("\n");
+    $bb->{color} = $worst_global_color;
 }
 
 sub handle_timedatectl {
+    my ($config) = @_;
+    my %thresholds = (
+        offset_warning  => $config->{timedatectl_offset_warning}  // 0.1,  # Default: 0.1 seconds
+        offset_critical => $config->{timedatectl_offset_critical} // 0.5,  # Default: 0.5 seconds
+    );
+
     unless (`systemctl status timedatectl | grep "Active: active (running)" | wc -l`) {
         $bb->color_line('yellow', "Check NTP : systemctl status timedatectl\n\n");
     }
+
     my @output = `timedatectl show-timesync 2>&1` or die;
     my %tracking = map { s/\s+/ /g; s/^ //; chop; split(/=/, $_, 2); } @output;
+
     if (defined $tracking{"NTPMessage"}) {
         $tracking{NTPMessage} =~ s/^{ //;
         $tracking{NTPMessage} =~ s/ }$//;
         my %NTPMessage = map { s/\s+/ /g; s/^ //; split(/=/, $_, 2); } (split(/,/, $tracking{NTPMessage}));
     }
+
     @output = `timedatectl timesync-status 2>&1` or die;
     %tracking = map { s/\s+/ /g; s/^ //; chop; split(/:/, $_, 2); } @output;
+
     my $peer = $tracking{'Server'};
-    $syspeer_stats->{'offset'} = convert_to_ms($tracking{'Offset'});
-    $syspeer_stats->{'delay'} = convert_to_ms($tracking{'Delay'});
-    $syspeer_stats->{'jitter'} = convert_to_ms($tracking{'Jitter'});
+    $syspeer_stats->{'offset'} = $tracking{'Offset'};
+    $syspeer_stats->{'delay'} = $tracking{'Delay'};
+    $syspeer_stats->{'jitter'} = $tracking{'Jitter'};
     $syspeer_stats->{'status'} = $tracking{'Leap'};
-    $bb->color_line($syspeer_stats->{'status'} =~ m/normal/ ? 'green' : 'yellow', "Leap status: " . ($syspeer_stats->{'status'} =~ m/normal/ ? "OK" : "-$syspeer_stats->{'status'}-") . "\n\n");
+
+    $bb->color_line($syspeer_stats->{'status'} =~ m/normal/ ? 'green' : 'yellow',
+        "Leap status: " . ($syspeer_stats->{'status'} =~ m/normal/ ? "OK" : "-$syspeer_stats->{'status'}-") . "\n\n");
+
     $syspeer_stats->{'found_syspeer'} = 1 if defined $tracking{'Server'};
     $bb->print("NTP peers: $peer\n\n");
-}
 
-sub handle_ntpd {
-    if (-f $ntpd_pid_file) {
-        $syspeer_stats->{'recently_started'} = (time - (stat($ntpd_pid_file))[9]) < 300;
+    if ($syspeer_stats->{'found_syspeer'}) {
+        $bb->print("\n");
+        my ($delay_value, $delay_unit) = format_time($syspeer_stats->{'delay'});
+        my ($offset_value, $offset_unit) = format_time($syspeer_stats->{'offset'});
+        my ($jitter_value, $jitter_unit) = format_time($syspeer_stats->{'jitter'});
+
+        $bb->print("SyspeerDelay: $delay_value $delay_unit\n");
+        $bb->print("SyspeerOffset: $offset_value $offset_unit\n");
+        $bb->print("SyspeerJitter: $jitter_value $jitter_unit\n\n");
+
+        $bb->print("SyspeerOffset thresholds:\n");
+        $bb->print("Warning: $thresholds{offset_warning}s\n");
+        $bb->print("Critical: $thresholds{offset_critical}s\n");
+
+        my $offset = abs($syspeer_stats->{'offset'});
+        if ($offset > $thresholds{offset_critical}) {
+            $bb->color_line('red', "SyspeerOffset > $thresholds{offset_critical}s\n");
+        } elsif ($offset > $thresholds{offset_warning}) {
+            $bb->color_line('yellow', "SyspeerOffset > $thresholds{offset_warning}s\n");
+        }
+
+        $trends->print("[${test_name},SyspeerDelay.rrd]\n");
+        $trends->print("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'delay'}\n");
+        $trends->print("[${test_name},SyspeerOffset.rrd]\n");
+        $trends->print("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'offset'}\n");
+        $trends->print("[${test_name},SyspeerJitter.rrd]\n");
+        $trends->print("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'jitter'}\n");
     } else {
-        $bb->color_line('yellow', "ntpd pid file $ntpd_pid_file not found. Is ntpd running?\n\n");
-    }
-    my @output = `ntpq -np 2>&1` or die;
-    $bb->print("NTP peers:\n\n");
-    foreach my $line (@output) {
-        if ($line =~ /^  / or $line =~ /^==/) {
-            $bb->print('   ' . $line);
-        } elsif ($line =~ /^\*\S+\s+\S+\s+\d+ \w\s+[\dm-]+\s+[\d-]+\s+[\d-]+\s+([\d\.-]+)\s+([-\d\.+]+)\s+([\d\.-]+)/) {
-            ($syspeer_stats->{'delay'}, $syspeer_stats->{'offset'}, $syspeer_stats->{'jitter'}) = ($1, $2, $3);
-            $bb->color_line('green', $line);
-            $syspeer_stats->{'found_syspeer'} = 1;
-        } elsif ($line =~ /^( |x|\.|\-|\+|\#|o)/) {
-            $bb->color_line('clear', $line);
-            $syspeer_stats->{'initializing'} = 1 if $line =~ /\.INIT\.|\.STEP\./;
+        $bb->print("\n");
+        if ($syspeer_stats->{'recently_started'} && $syspeer_stats->{'initializing'}) {
+            $bb->color_line('yellow', "No system peer entry (\"*\") found; ntpd was recently started and is initializing.\n");
         } else {
-            $bb->color_line('yellow', $line);
+            $bb->color_line('red', "No system peer entry (\"*\") found\n");
         }
     }
 }
 
-sub convert_to_ms {
-    my ($to_convert) = @_;
-    return -1 unless defined $to_convert;
-    my $ms_result = -1;
-    if ($to_convert =~ m/([-+.\d]+)(us|ms|s)$/) {
-        $ms_result = $1;
-        $ms_result /= 1000 if $2 eq 'us';  # Convert microseconds to milliseconds
-        $ms_result *= 1000 if $2 eq 's';   # Convert seconds to milliseconds
-    }
-    return $ms_result;
-}
-
-sub print_syspeer_info {
-    $bb->print("\n");
-    $bb->print("SyspeerDelay: $syspeer_stats->{'delay'}\n");
-    $bb->print("SyspeerOffset: $syspeer_stats->{'offset'}\n");
-    $bb->print("SyspeerJitter: $syspeer_stats->{'jitter'}\n\n");
-    $bb->print("SyspeerOffset thresholds:\n");
-    $bb->print("Warning: ${offset_warning}ms\n");
-    $bb->print("Critical: ${offset_critical}ms\n");
-    my $offset = abs($syspeer_stats->{'offset'});
-    if ($offset > $offset_critical) {
-        $bb->color_line('red', "SyspeerOffset > ${offset_critical}ms\n");
-    } elsif ($offset > $offset_warning) {
-        $bb->color_line('yellow', "SyspeerOffset > ${offset_warning}ms\n");
-    }
-    $trends->print("[${test_name},SyspeerDelay.rrd]\n");
-    $trends->print("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'delay'}\n");
-    $trends->print("[${test_name},SyspeerOffset.rrd]\n");
-    $trends->print("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'offset'}\n");
-    $trends->print("[${test_name},SyspeerJitter.rrd]\n");
-    $trends->print("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'jitter'}\n");
-}
-
-sub print_no_syspeer_entry {
-    $bb->print("\n");
-    if ($syspeer_stats->{'recently_started'} && $syspeer_stats->{'initializing'}) {
-        $bb->color_line('yellow', "No system peer entry (\"*\") found; ntpd was recently started and is initializing.\n");
+sub handle_ntpd {
+    # Check if the ntpd PID file exists
+    if (-f $ntpd_pid_file) {
+        $syspeer_stats->{'recently_started'} = (time - (stat($ntpd_pid_file))[9]) < 300;
     } else {
-        $bb->color_line('red', "No system peer entry (\"*\") found\n");
+        $bb->color_line('yellow', "ntpd pid file $ntpd_pid_file not found. Is ntpd running?\n\n");
+        return;
+    }
+
+    # Execute the ntpq command
+    my @output = `ntpq -np 2>&1`;
+    if ($? != 0 || !@output) {
+        $bb->color_line('red', "Failed to execute 'ntpq' command. Check ntpd status.\n\n");
+        return;
+    }
+
+    # Initialize syspeer_stats
+    $syspeer_stats->{'found_syspeer'} = 0;
+    $syspeer_stats->{'initializing'} = 0;
+
+    # Print NTP peers header
+    $bb->print("NTP peers:\n\n");
+
+    # Process each line of ntpq output
+    foreach my $line (@output) {
+        if ($line =~ /^  / or $line =~ /^==/) {
+            # Print general lines without special processing
+            $bb->print('   ' . $line);
+        } elsif ($line =~ /^\*\S+\s+\S+\s+\d+ \w\s+[\dm-]+\s+[\d-]+\s+[\d-]+\s+([\d\.-]+)\s+([-\d\.+]+)\s+([\d\.-]+)/) {
+            # Extract delay, offset, and jitter for the system peer
+            ($syspeer_stats->{'delay'}, $syspeer_stats->{'offset'}, $syspeer_stats->{'jitter'}) = ($1, $2, $3);
+            $bb->color_line('green', $line);
+            $syspeer_stats->{'found_syspeer'} = 1;
+        } elsif ($line =~ /^( |x|\.|\-|\+|\#|o)/) {
+            # Handle other status lines
+            $bb->color_line('clear', $line);
+            $syspeer_stats->{'initializing'} = 1 if $line =~ /\.INIT\.|\.STEP\./;
+        } else {
+            # Warn about unexpected lines
+            $bb->color_line('yellow', $line);
+        }
+    }
+
+    # Check if a system peer entry was found
+    if ($syspeer_stats->{'found_syspeer'}) {
+        # Print syspeer information
+        $bb->print("\n");
+        $bb->print("SyspeerDelay: $syspeer_stats->{'delay'}\n");
+        $bb->print("SyspeerOffset: $syspeer_stats->{'offset'}\n");
+        $bb->print("SyspeerJitter: $syspeer_stats->{'jitter'}\n\n");
+
+        # Check thresholds and print warnings
+        $bb->print("SyspeerOffset thresholds:\n");
+        $bb->print("Warning: ${offset_warning}ms\n");
+        $bb->print("Critical: ${offset_critical}ms\n");
+        my $offset = abs($syspeer_stats->{'offset'});
+        if ($offset > $offset_critical) {
+            $bb->color_line('red', "SyspeerOffset > ${offset_critical}ms\n");
+        } elsif ($offset > $offset_warning) {
+            $bb->color_line('yellow', "SyspeerOffset > ${offset_warning}ms\n");
+        }
+
+        # Send syspeer statistics to trends
+        $trends->print("[${test_name},SyspeerDelay.rrd]\n");
+        $trends->print("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'delay'}\n");
+        $trends->print("[${test_name},SyspeerOffset.rrd]\n");
+        $trends->print("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'offset'}\n");
+        $trends->print("[${test_name},SyspeerJitter.rrd]\n");
+        $trends->print("DS:lambda:GAUGE:600:U:U $syspeer_stats->{'jitter'}\n");
+    } else {
+        # Handle case where no system peer entry was found
+        $bb->print("\n");
+        if ($syspeer_stats->{'recently_started'} && $syspeer_stats->{'initializing'}) {
+            $bb->color_line('yellow', "No system peer entry ('*') found; ntpd was recently started and is initializing.\n");
+        } else {
+            $bb->color_line('red', "No system peer entry ('*') found\n");
+        }
     }
 }
