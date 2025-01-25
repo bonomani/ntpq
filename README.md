@@ -1,10 +1,11 @@
 # ntpq
-Hobbit/Xymon NTPQ with Chrony and Timedatectl/systemd-timesync support
-
-Add to the Hobbit/Xymon Plugin "ntpq" the comptatibility with "chronyd", "ntpd" should continue to work (not tested so far)
+The Xymon script monitors ntpd, chrony, and timedatectl/systemd-timesyncd to assess NTP synchronization status, providing detailed metrics like Offset, Delay, and Jitter. 
+It supports configurable warning and critical thresholds, integrates seamlessly with Xymon for status reporting, and ensures compatibility across varied system setups by dynamically detecting and adapting to the available NTP service
 
 Tested on debian 11,12 chrony v4.0
-- Last Update 15.02.2024: Restructure the code
+- Last Update 25.01.2025: 
+  - Restructure the code to make it easier to maintain
+  - Improve the chrony parts
 
 How to install 
 - Install Xymon Client (should have already): apt install xymon-client
