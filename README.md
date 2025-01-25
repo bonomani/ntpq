@@ -13,5 +13,6 @@ How to install
 - Install Xymon Client (should have already): apt install xymon-client
 - Install Xymon ntpq and other plugin (if not already):apt install hobbit-plugins
 - Replace original (/usr/lib/xymon/client/ext/ntpq but it could be erased with an update...that is what I do for now) or ???
+- (Optional: Use [xymonbody](https://github.com/bonomani/xymonbody.css) for better icon alignment)
 
 ![ntpq-chronyd](https://github.com/user-attachments/assets/6dbc8dca-07f0-4869-af00-0d67a9c42eab)
